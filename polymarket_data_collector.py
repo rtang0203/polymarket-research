@@ -1,6 +1,7 @@
 """
-Polymarket Data Collector
-Collects historical market and trade data for win-rate analysis
+Polymarket Data Collector (Simple)
+Collects historical market and trade data for win-rate analysis.
+Fetches most recent resolved markets ordered by volume.
 """
 
 import requests
@@ -11,9 +12,11 @@ from typing import List, Dict, Optional
 import json
 from pathlib import Path
 
+
 class PolymarketDataCollector:
     """
-    Collector for Polymarket market and trade data
+    Simple collector for Polymarket market and trade data.
+    Fetches most recent resolved markets ordered by volume.
     """
 
     def __init__(self, output_dir: str = "polymarket_data"):
@@ -27,14 +30,14 @@ class PolymarketDataCollector:
         self.min_request_interval = 0.1  # 100ms between requests
 
     def _rate_limit(self):
-        """Simple rate limiting to avoid hitting API limits"""
+        """Simple rate limiting to avoid hitting API limits."""
         elapsed = time.time() - self.last_request_time
         if elapsed < self.min_request_interval:
             time.sleep(self.min_request_interval - elapsed)
         self.last_request_time = time.time()
 
     def _make_request(self, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """Make a GET request with error handling"""
+        """Make a GET request with error handling."""
         self._rate_limit()
         try:
             response = requests.get(url, params=params, timeout=30)
@@ -44,13 +47,42 @@ class PolymarketDataCollector:
             print(f"Error fetching {url}: {e}")
             return None
 
+    def _parse_market_times(self, processed_market: Dict) -> tuple[Optional[datetime], Optional[datetime]]:
+        """Parse start and end times from processed market data."""
+        start_time = None
+        end_time = None
+
+        try:
+            start_str = processed_market.get('created_at')
+            end_str = processed_market.get('resolved_at')
+
+            if start_str:
+                start_str = start_str.replace('Z', '+00:00')
+                if start_str.endswith('+00'):
+                    start_str = start_str + ':00'
+                start_time = datetime.fromisoformat(start_str)
+                if start_time.tzinfo is None:
+                    start_time = start_time.replace(tzinfo=timezone.utc)
+
+            if end_str:
+                end_str = end_str.replace('Z', '+00:00')
+                if end_str.endswith('+00'):
+                    end_str = end_str + ':00'
+                end_time = datetime.fromisoformat(end_str)
+                if end_time.tzinfo is None:
+                    end_time = end_time.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+
+        return start_time, end_time
+
     def get_markets(self,
-                   closed: Optional[bool] = None,
-                   limit: int = 100,
-                   offset: int = 0,
-                   **filters) -> List[Dict]:
+                    closed: Optional[bool] = None,
+                    limit: int = 100,
+                    offset: int = 0,
+                    **filters) -> List[Dict]:
         """
-        Fetch markets from Gamma API
+        Fetch markets from Gamma API.
 
         Args:
             closed: Filter by closed/open markets (True/False/None for all)
@@ -64,8 +96,8 @@ class PolymarketDataCollector:
         params = {
             'limit': limit,
             'offset': offset,
-            'order': 'volume',  # Order by volume to get active markets
-            'ascending': 'false',  # Descending - highest volume first
+            'order': 'volume',
+            'ascending': 'false',
             **filters
         }
 
@@ -78,11 +110,11 @@ class PolymarketDataCollector:
         return data if data else []
 
     def get_all_markets(self,
-                       closed: bool = True,
-                       max_markets: Optional[int] = None,
-                       **filters) -> List[Dict]:
+                        closed: bool = True,
+                        max_markets: Optional[int] = None,
+                        **filters) -> List[Dict]:
         """
-        Fetch all markets with pagination
+        Fetch all markets with pagination.
 
         Args:
             closed: Only get closed markets (True) or open markets (False)
@@ -112,7 +144,6 @@ class PolymarketDataCollector:
             all_markets.extend(markets)
             print(f"Fetched {len(all_markets)} markets so far...")
 
-            # Check if we've hit the limit or got fewer results than requested
             if max_markets and len(all_markets) >= max_markets:
                 all_markets = all_markets[:max_markets]
                 break
@@ -121,14 +152,14 @@ class PolymarketDataCollector:
                 break
 
             offset += limit
-            time.sleep(0.5)  # Be nice to the API
+            time.sleep(0.5)
 
         print(f"Total markets fetched: {len(all_markets)}")
         return all_markets
 
-    def get_all_trades_for_market(self, condition_id: str, max_trades: Optional[int] = None) -> tuple[List[Dict], bool]:
+    def get_trades_for_market(self, condition_id: str, max_trades: Optional[int] = None) -> tuple[List[Dict], bool]:
         """
-        Fetch trades for a specific market
+        Fetch trades for a specific market.
 
         Args:
             condition_id: Market's conditionId
@@ -140,9 +171,10 @@ class PolymarketDataCollector:
         all_trades = []
         before = None
         truncated = False
+        batch_size = 500  # API max
 
         while True:
-            params = {'market': condition_id, 'limit': 100}
+            params = {'market': condition_id, 'limit': batch_size}
             if before:
                 params['before'] = before
 
@@ -154,16 +186,14 @@ class PolymarketDataCollector:
 
             all_trades.extend(trades)
 
-            # Check if we've hit the max trades limit
             if max_trades and len(all_trades) >= max_trades:
                 all_trades = all_trades[:max_trades]
                 truncated = True
                 break
 
-            if len(trades) < 100:
+            if len(trades) < batch_size:
                 break
 
-            # Use the timestamp of the last trade for pagination
             before = trades[-1]['timestamp']
             time.sleep(0.2)
 
@@ -171,7 +201,7 @@ class PolymarketDataCollector:
 
     def process_market_for_analysis(self, market: Dict) -> Optional[Dict]:
         """
-        Extract relevant information from a market for analysis
+        Extract relevant information from a market for analysis.
 
         Args:
             market: Market dictionary from Gamma API
@@ -179,11 +209,9 @@ class PolymarketDataCollector:
         Returns:
             Processed market dictionary with key fields
         """
-        # Only process closed markets
         if not market.get('closed', False):
             return None
 
-        # Parse outcomes and prices (they're JSON strings)
         try:
             outcomes = json.loads(market.get('outcomes', '[]'))
             outcome_prices = json.loads(market.get('outcomePrices', '[]'))
@@ -193,7 +221,6 @@ class PolymarketDataCollector:
         if not outcomes or not outcome_prices:
             return None
 
-        # Find winning outcome (price = "1" or close to 1)
         winning_outcome = None
         tokens = {}
         for i, (outcome, price) in enumerate(zip(outcomes, outcome_prices)):
@@ -202,7 +229,7 @@ class PolymarketDataCollector:
             except (ValueError, TypeError):
                 price_float = 0
 
-            is_winner = price_float > 0.99  # Winner has price ~1
+            is_winner = price_float > 0.99
             tokens[outcome] = {
                 'index': i,
                 'winner': is_winner,
@@ -211,13 +238,19 @@ class PolymarketDataCollector:
                 winning_outcome = outcome
 
         if winning_outcome is None:
-            return None  # Not properly resolved
+            return None
 
-        # Extract key fields (note: API uses camelCase)
-        processed = {
+        category = market.get('category') or ''
+        if not category:
+            events = market.get('events', [])
+            if events and isinstance(events, list) and len(events) > 0:
+                category = events[0].get('category') or ''
+        category = str(category) if category else ''
+
+        return {
             'condition_id': market.get('conditionId'),
             'question': market.get('question'),
-            'category': market.get('category'),
+            'category': category,
             'created_at': market.get('createdAt'),
             'end_date': market.get('endDate'),
             'resolved_at': market.get('closedTime'),
@@ -227,19 +260,80 @@ class PolymarketDataCollector:
             'tokens': tokens
         }
 
-        return processed
+    def _process_trades(self, trades: List[Dict], processed_market: Dict) -> List[Dict]:
+        """Convert raw trades to analysis-ready format."""
+        condition_id = processed_market['condition_id']
+        _, resolved_time = self._parse_market_times(processed_market)
+
+        trade_data = []
+        for trade in trades:
+            outcome = trade.get('outcome')
+            if not outcome:
+                continue
+
+            trade_timestamp = trade.get('timestamp')
+            time_to_resolution = None
+            trade_time = None
+
+            if trade_timestamp:
+                trade_time = datetime.fromtimestamp(trade_timestamp, tz=timezone.utc)
+                if resolved_time:
+                    time_to_resolution = (resolved_time - trade_time).total_seconds()
+
+            won = processed_market['tokens'].get(outcome, {}).get('winner', False)
+
+            trade_data.append({
+                'condition_id': condition_id,
+                'question': processed_market['question'],
+                'category': processed_market['category'],
+                'trade_timestamp': trade_time,
+                'resolved_at': processed_market['resolved_at'],
+                'time_to_resolution_hours': time_to_resolution / 3600 if time_to_resolution else None,
+                'price': trade.get('price'),
+                'size': trade.get('size'),
+                'side': trade.get('side'),
+                'outcome': outcome,
+                'won': won,
+                'volume_total': processed_market['volume'],
+            })
+
+        return trade_data
+
+    def _print_summary(self, df: pd.DataFrame, markets_processed: int,
+                       markets_with_trades: int, markets_skipped_no_resolution: int,
+                       markets_skipped_no_trades: int, output_file: Path):
+        """Print collection summary."""
+        print(f"\n{'='*60}")
+        print(f"Data collection complete!")
+        print(f"Markets processed: {markets_processed}")
+        print(f"  - With trades: {markets_with_trades}")
+        print(f"  - Skipped (no resolution): {markets_skipped_no_resolution}")
+        print(f"  - Skipped (no trades): {markets_skipped_no_trades}")
+        print(f"Total trades collected: {len(df)}")
+        print(f"Saved to: {output_file}")
+
+        if len(df) > 0:
+            trades_per_market = df.groupby('condition_id').size()
+            print(f"\nTrades per market distribution:")
+            print(f"  Min: {trades_per_market.min()}, Max: {trades_per_market.max()}, Median: {trades_per_market.median():.0f}")
+            print(f"  Markets with <10 trades:  {(trades_per_market < 10).sum()}")
+            print(f"  Markets with <50 trades:  {(trades_per_market < 50).sum()}")
+            print(f"  Markets with <100 trades: {(trades_per_market < 100).sum()}")
+            print(f"  Markets with 100+ trades: {(trades_per_market >= 100).sum()}")
+
+        print(f"{'='*60}")
 
     def collect_dataset(self,
-                       num_markets: int = 1000,
-                       max_trades_per_market: int = 10000,
-                       category: Optional[str] = None,
-                       save_raw: bool = True) -> pd.DataFrame:
+                        num_markets: int = 1000,
+                        max_trades_per_market: int = 10000,
+                        category: Optional[str] = None,
+                        save_raw: bool = True) -> pd.DataFrame:
         """
-        Collect a full dataset for analysis
+        Collect a dataset from the most recent resolved markets (by volume).
 
         Args:
             num_markets: Number of markets to collect
-            max_trades_per_market: Max trades to collect per market (prevents huge markets from stalling)
+            max_trades_per_market: Max trades to collect per market
             category: Filter by category (e.g., 'politics', 'sports', 'crypto')
             save_raw: Whether to save raw JSON data
 
@@ -247,26 +341,22 @@ class PolymarketDataCollector:
             DataFrame with trade data ready for analysis
         """
         print("=" * 60)
-        print("POLYMARKET DATA COLLECTION")
-        print(f"Max trades per market: {max_trades_per_market:,}")
+        print("POLYMARKET DATA COLLECTION (Simple)")
+        print(f"Markets: {num_markets}, Max trades per market: {max_trades_per_market:,}")
         print("=" * 60)
 
-        # Step 1: Get resolved markets
+        # Get resolved markets
         filters = {}
         if category:
             filters['tag'] = category
 
-        markets = self.get_all_markets(
-            closed=True,
-            max_markets=num_markets,
-            **filters
-        )
+        markets = self.get_all_markets(closed=True, max_markets=num_markets, **filters)
 
         if save_raw:
             with open(self.output_dir / 'raw_markets.json', 'w') as f:
                 json.dump(markets, f, indent=2)
 
-        # Step 2: Process markets and collect trades
+        # Process markets and collect trades
         all_trade_data = []
         markets_with_trades = 0
         markets_skipped_no_resolution = 0
@@ -282,10 +372,9 @@ class PolymarketDataCollector:
                 print(f"  Skipped: No valid resolution data")
                 continue
 
-            condition_id = processed_market['condition_id']
-
-            # Get trades for this market
-            trades, was_truncated = self.get_all_trades_for_market(condition_id, max_trades_per_market)
+            trades, was_truncated = self.get_trades_for_market(
+                processed_market['condition_id'], max_trades_per_market
+            )
 
             if not trades:
                 markets_skipped_no_trades += 1
@@ -296,121 +385,41 @@ class PolymarketDataCollector:
             print(f"  Found {len(trades)} trades{truncation_note}")
             markets_with_trades += 1
 
-            # Process each trade
-            for trade in trades:
-                # Get outcome from trade (the API provides it directly)
-                outcome = trade.get('outcome')
-                if not outcome:
-                    continue
+            all_trade_data.extend(self._process_trades(trades, processed_market))
 
-                # Calculate time to resolution
-                trade_timestamp = trade.get('timestamp')
-                time_to_resolution = None
-                trade_time = None
-
-                if trade_timestamp:
-                    trade_time = datetime.fromtimestamp(trade_timestamp, tz=timezone.utc)
-
-                    if processed_market['resolved_at']:
-                        try:
-                            resolved_str = processed_market['resolved_at']
-                            # Handle various timestamp formats
-                            if '+' in resolved_str or 'Z' in resolved_str:
-                                resolved_str = resolved_str.replace('Z', '+00:00')
-                                if resolved_str.endswith('+00'):
-                                    resolved_str = resolved_str + ':00'
-                            resolved_time = datetime.fromisoformat(resolved_str)
-                            if resolved_time.tzinfo is None:
-                                resolved_time = resolved_time.replace(tzinfo=timezone.utc)
-                            time_to_resolution = (resolved_time - trade_time).total_seconds()
-                        except Exception:
-                            pass
-
-                # Did this outcome win?
-                won = processed_market['tokens'].get(outcome, {}).get('winner', False)
-
-                trade_data = {
-                    'condition_id': condition_id,
-                    'question': processed_market['question'],
-                    'category': processed_market['category'],
-                    'trade_timestamp': trade_time,
-                    'resolved_at': processed_market['resolved_at'],
-                    'time_to_resolution_hours': time_to_resolution / 3600 if time_to_resolution else None,
-                    'price': trade.get('price'),
-                    'size': trade.get('size'),
-                    'side': trade.get('side'),  # BUY or SELL
-                    'outcome': outcome,  # Yes or No
-                    'won': won,
-                    'volume_total': processed_market['volume'],
-                }
-
-                all_trade_data.append(trade_data)
-
-            # Save progress periodically
             if (i + 1) % 50 == 0:
                 temp_df = pd.DataFrame(all_trade_data)
                 temp_df.to_csv(self.output_dir / f'trades_progress_{i+1}.csv', index=False)
                 print(f"\n  Progress saved: {len(all_trade_data)} trades from {markets_with_trades} markets")
 
-        # Create final DataFrame
+        # Save final dataset
         df = pd.DataFrame(all_trade_data)
-
-        # Save complete dataset
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_file = self.output_dir / f'polymarket_trades_{timestamp}.csv'
         df.to_csv(output_file, index=False)
 
-        print(f"\n{'='*60}")
-        print(f"Data collection complete!")
-        print(f"Markets processed: {len(markets)}")
-        print(f"  - With trades: {markets_with_trades}")
-        print(f"  - Skipped (no resolution): {markets_skipped_no_resolution}")
-        print(f"  - Skipped (no trades): {markets_skipped_no_trades}")
-        print(f"Total trades collected: {len(df)}")
-        print(f"Saved to: {output_file}")
-
-        # Show trades-per-market distribution
-        if len(df) > 0:
-            trades_per_market = df.groupby('condition_id').size()
-            print(f"\nTrades per market distribution:")
-            print(f"  Min: {trades_per_market.min()}, Max: {trades_per_market.max()}, Median: {trades_per_market.median():.0f}")
-            print(f"  Markets with <10 trades:  {(trades_per_market < 10).sum()}")
-            print(f"  Markets with <50 trades:  {(trades_per_market < 50).sum()}")
-            print(f"  Markets with <100 trades: {(trades_per_market < 100).sum()}")
-            print(f"  Markets with 100+ trades: {(trades_per_market >= 100).sum()}")
-
-        print(f"{'='*60}")
+        self._print_summary(df, len(markets), markets_with_trades,
+                           markets_skipped_no_resolution, markets_skipped_no_trades, output_file)
 
         return df
 
 
 def main():
     """Example usage"""
-    output_directory = "polymarket_data"
-    collector = PolymarketDataCollector(output_dir=output_directory)
+    collector = PolymarketDataCollector(output_dir="polymarket_data")
 
-    # Collect data for 500 resolved markets (ordered by volume)
     df = collector.collect_dataset(
         num_markets=500,
-        max_trades_per_market=10000,  # Cap trades per market to avoid huge markets stalling
-        category=None,  # Set to 'politics', 'sports', 'crypto', etc. to filter
+        max_trades_per_market=10000,
+        category=None,
         save_raw=True
     )
 
     if len(df) > 0:
-        # Quick summary
         print("\nDataset Summary:")
         print(f"Total trades: {len(df)}")
         print(f"Unique markets: {df['condition_id'].nunique()}")
         print(f"Date range: {df['trade_timestamp'].min()} to {df['trade_timestamp'].max()}")
-        print(f"\nCategories:")
-        print(df['category'].value_counts())
-        print(f"\nOutcomes:")
-        print(df['outcome'].value_counts())
-        print(f"\nWin rate:")
-        print(df['won'].value_counts(normalize=True))
-    else:
-        print("\nNo trades collected. Check API responses.")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,30 @@
 
 ### ✅ Implemented
 
-#### Data Collection (`polymarket_data_collector.py`)
+#### Data Collection
+
+Two collector classes for different use cases:
+
+**Simple Collector (`polymarket_data_collector.py`)**
+- `PolymarketDataCollector` class
+- Fetches most recent resolved markets ordered by volume
+- `collect_dataset()` - main collection method
+- Best for: Quick data collection, testing
+
+**Sampled Collector (`polymarket_sampled_collector.py`)**
+- `PolymarketSampledCollector` class (extends base)
+- Collects markets across multiple time windows (weeks)
+- Samples trades from large markets to avoid bias toward recent trades
+- `collect_by_time_windows()` - main collection method
+- Best for: Comprehensive analysis with good time coverage
+
+**Trade Fetching Behavior:**
+- API max batch size: 500 trades per request
+- Small/medium markets (<2000 trades): fetches ALL trades
+- Large markets (2000+ trades): keeps newest 2000, marks as "sampled"
+- The 2000 threshold is effectively a cap for most markets
+
+**Shared Features:**
 - **Gamma API Integration**: Fetches resolved markets with metadata
 - **Data API Integration**: Collects historical trade data
 - **Pagination Support**: Handles large datasets with automatic pagination

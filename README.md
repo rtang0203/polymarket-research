@@ -16,19 +16,54 @@ pip install pandas numpy matplotlib seaborn scipy requests
 
 ### 1. Collect Data
 
+Two collection methods are available:
+
+#### Option A: Simple Collection (Most Recent Markets)
+
 ```bash
 python3 polymarket_data_collector.py
 ```
 
-This will:
-- Fetch resolved markets from Polymarket's Gamma API
-- Collect all trades for each market
-- Save data to `polymarket_data/polymarket_trades_YYYYMMDD_HHMMSS.csv`
+This fetches the most recent resolved markets ordered by volume. Fast but biased toward recent data.
 
-**Configuration options** in `PolymarketDataCollector.collect_dataset()`:
-- `num_markets`: Number of markets to collect (default: 500)
-- `category`: Filter by category - 'politics', 'sports', 'crypto', etc. (default: None = all)
-- `save_raw`: Save raw JSON market data (default: True)
+```python
+from polymarket_data_collector import PolymarketDataCollector
+
+collector = PolymarketDataCollector(output_dir="polymarket_data")
+df = collector.collect_dataset(
+    num_markets=500,           # Number of markets to collect
+    max_trades_per_market=10000,
+    category=None,             # 'politics', 'sports', 'crypto', etc.
+    save_raw=True
+)
+```
+
+#### Option B: Time-Window Collection (Recommended)
+
+```bash
+python3 polymarket_sampled_collector.py
+```
+
+This collects markets across multiple weeks for better time coverage, and samples trades from large markets.
+
+```python
+from polymarket_sampled_collector import PolymarketSampledCollector
+
+collector = PolymarketSampledCollector(output_dir="polymarket_data")
+df = collector.collect_by_time_windows(
+    weeks_back=8,              # How many weeks to go back
+    markets_per_window=100,    # Markets per week (800 total)
+    max_trades_per_market=10000,
+    save_raw=True
+)
+```
+
+**Trade Fetching Behavior:**
+- Markets with <2000 trades: ALL trades are fetched
+- Markets with 2000+ trades: keep newest 2000, sample from older portion if applicable
+- API fetches 500 trades per request (max allowed)
+
+**Output:** Data saved to `polymarket_data/polymarket_trades_YYYYMMDD_HHMMSS.csv`
 
 ### 2. Analyze Data
 
@@ -180,12 +215,22 @@ Combine multiple signals:
 - Liquidity level
 - Recent price movement
 
+## Testing
+
+Test the sampling functionality:
+
+```bash
+python3 test_sampling.py                           # Run default tests
+python3 test_sampling.py -c <condition_id>         # Test specific market
+python3 test_sampling.py -c <condition_id> --all   # Compare sampled vs full fetch
+```
+
 ## Rate Limiting
 
 The data collector implements basic rate limiting:
 - 100ms between requests
 - Additional 0.5s sleep between market pagination
-- 0.2s sleep between trade pagination
+- 0.1-0.2s sleep between trade pagination
 
 For large-scale collection, monitor for HTTP 429 (rate limit) responses.
 
