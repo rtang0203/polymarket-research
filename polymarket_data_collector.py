@@ -169,14 +169,12 @@ class PolymarketDataCollector:
             Tuple of (list of trades, was_truncated)
         """
         all_trades = []
-        before = None
+        offset = 0
         truncated = False
         batch_size = 500  # API max
 
         while True:
-            params = {'market': condition_id, 'limit': batch_size}
-            if before:
-                params['before'] = before
+            params = {'market': condition_id, 'limit': batch_size, 'offset': offset}
 
             url = f"{self.data_api_url}/trades"
             trades = self._make_request(url, params)
@@ -194,7 +192,7 @@ class PolymarketDataCollector:
             if len(trades) < batch_size:
                 break
 
-            before = trades[-1]['timestamp']
+            offset += batch_size
             time.sleep(0.2)
 
         return all_trades, truncated

@@ -29,7 +29,7 @@ class PolymarketSampledCollector(PolymarketDataCollector):
 
         Strategy:
         - Small/medium markets (<2000 trades): fetch all trades
-        - Large markets (2000+ trades): keep newest 2000, sample from older portion
+        - Large markets (2000+ trades): keep newest 2000, sample evenly from older portion
 
         Args:
             condition_id: Market's conditionId
@@ -39,120 +39,231 @@ class PolymarketSampledCollector(PolymarketDataCollector):
         Returns:
             Tuple of (list of trades, was_sampled)
         """
+        import random
+
         url = f"{self.data_api_url}/trades"
         batch_size = 500  # API max
+        offset = 0
 
-        # Phase 1: Fetch first batch to assess market size
-        params = {'market': condition_id, 'limit': batch_size}
-        batch = self._make_request(url, params)
-
-        if not batch:
-            return [], False
-
-        all_probed_trades = list(batch)
-
-        if len(batch) < batch_size:
-            return all_probed_trades, False
-
-        before = batch[-1]['timestamp']
-
-        # Phase 2: Continue fetching to 2000 trades
-        while len(all_probed_trades) < 2000:
-            params = {'market': condition_id, 'limit': batch_size, 'before': before}
+        # Phase 1: Fetch up to 2000 trades to assess market size
+        all_trades = []
+        while len(all_trades) < 2000:
+            params = {'market': condition_id, 'limit': batch_size, 'offset': offset}
             batch = self._make_request(url, params)
+
             if not batch:
                 break
 
-            all_probed_trades.extend(batch)
+            all_trades.extend(batch)
 
             if len(batch) < batch_size:
-                return all_probed_trades, False
+                # We've fetched all trades, no sampling needed
+                return all_trades[:max_trades], False
 
-            before = batch[-1]['timestamp']
+            offset += batch_size
             time.sleep(0.1)
 
-        if len(all_probed_trades) < 2000:
-            return all_probed_trades, False
+        if len(all_trades) < 2000:
+            return all_trades[:max_trades], False
 
-        # Phase 3: Large market - sample from older portion
-        newest_ts = all_probed_trades[0]['timestamp']
-        oldest_probed_ts = all_probed_trades[-1]['timestamp']
+        # Phase 2: Large market - continue fetching all trades for sampling
+        # Fetch remaining trades (up to a reasonable limit to avoid huge fetches)
+        max_fetch = max(max_trades * 2, 10000)  # Fetch enough to sample from
 
-        # Probe backward to find time range
-        oldest_ts = oldest_probed_ts
-        probe_count = 0
+        while len(all_trades) < max_fetch:
+            params = {'market': condition_id, 'limit': batch_size, 'offset': offset}
+            batch = self._make_request(url, params)
 
-        while probe_count < 5:
-            batch = self._make_request(url, {'market': condition_id, 'limit': batch_size, 'before': oldest_ts})
             if not batch:
                 break
-            oldest_ts = batch[-1]['timestamp']
+
+            all_trades.extend(batch)
+
             if len(batch) < batch_size:
                 break
-            probe_count += 1
+
+            offset += batch_size
             time.sleep(0.1)
 
-        # Check if time span is too short to bother sampling
-        time_range = newest_ts - oldest_ts
-        if time_range < 3600:
-            return all_probed_trades[:max_trades], True
+        # If we have fewer trades than max_trades, return all
+        if len(all_trades) <= max_trades:
+            return all_trades, False
 
-        older_time_range = oldest_probed_ts - oldest_ts
-        if older_time_range < 3600:
-            return all_probed_trades[:max_trades], True
+        # Phase 3: Sample to get good time coverage
+        # Keep newest 2000, sample evenly from the rest
+        newest_trades = all_trades[:2000]
+        older_trades = all_trades[2000:]
 
-        # Sample from older portion
-        remaining_budget = max_trades - len(all_probed_trades)
+        remaining_budget = max_trades - len(newest_trades)
         if remaining_budget <= 0:
-            return all_probed_trades[:max_trades], True
+            return newest_trades[:max_trades], True
 
-        older_windows = min(num_windows, 5)
-        window_size = older_time_range / older_windows
-        trades_per_window = remaining_budget // older_windows
+        if len(older_trades) <= remaining_budget:
+            # Can keep all older trades
+            sampled = newest_trades + older_trades
+        else:
+            # Sample evenly across time windows from older trades
+            older_windows = min(num_windows, 5)
+            window_size = len(older_trades) // older_windows
+            samples_per_window = remaining_budget // older_windows
 
-        seen_ids = {t.get('transactionHash', str(t['timestamp'])) for t in all_probed_trades}
-        older_trades = []
+            sampled_older = []
+            for i in range(older_windows):
+                window_start = i * window_size
+                window_end = (i + 1) * window_size if i < older_windows - 1 else len(older_trades)
+                window_trades = older_trades[window_start:window_end]
 
-        for i in range(older_windows):
-            window_start = oldest_ts + (i * window_size)
-            window_end = oldest_ts + ((i + 1) * window_size)
+                if len(window_trades) <= samples_per_window:
+                    sampled_older.extend(window_trades)
+                else:
+                    sampled_older.extend(random.sample(window_trades, samples_per_window))
 
+            sampled = newest_trades + sampled_older
+
+        # Sort by timestamp and return
+        sampled.sort(key=lambda x: x['timestamp'], reverse=True)
+        return sampled[:max_trades], True
+
+    def _fetch_markets_for_window(self,
+                                   start_date: str,
+                                   end_date: str,
+                                   max_markets: int) -> List[Dict]:
+        """
+        Fetch markets for a specific time window with pagination.
+
+        Args:
+            start_date: Start date string (YYYY-MM-DD)
+            end_date: End date string (YYYY-MM-DD)
+            max_markets: Maximum markets to fetch for this window
+
+        Returns:
+            List of market dictionaries
+        """
+        url = f"{self.gamma_url}/markets"
+        batch_size = 100  # API limit per request
+        offset = 0
+        markets = []
+
+        while len(markets) < max_markets:
             params = {
-                'market': condition_id,
-                'limit': batch_size,
-                'before': int(window_end) + 1
+                'closed': 'true',
+                'limit': min(batch_size, max_markets - len(markets)),
+                'offset': offset,
+                'order': 'volume',
+                'ascending': 'false',
+                'end_date_min': start_date,
+                'end_date_max': end_date,
             }
 
-            window_trades = []
-            attempts = 0
+            batch = self._make_request(url, params)
 
-            while len(window_trades) < trades_per_window and attempts < 3:
-                trades = self._make_request(url, params)
-                if not trades:
-                    break
+            if not batch:
+                break
 
-                for t in trades:
-                    ts = t['timestamp']
-                    tx_hash = t.get('transactionHash', str(ts))
+            markets.extend(batch)
 
-                    if ts >= window_start and ts < window_end and tx_hash not in seen_ids:
-                        window_trades.append(t)
-                        seen_ids.add(tx_hash)
-                        if len(window_trades) >= trades_per_window:
-                            break
+            if len(batch) < batch_size:
+                break
 
-                if len(trades) < batch_size or trades[-1]['timestamp'] < window_start:
-                    break
+            offset += batch_size
+            time.sleep(0.1)
 
-                params['before'] = trades[-1]['timestamp']
-                attempts += 1
-                time.sleep(0.1)
+        return markets
 
-            older_trades.extend(window_trades)
+    def _fetch_all_markets(self,
+                           weeks_back: int,
+                           markets_per_window: int) -> List[Dict]:
+        """
+        Fetch markets across multiple weekly time windows.
 
-        combined = all_probed_trades + older_trades
-        combined.sort(key=lambda x: x['timestamp'])
-        return combined[:max_trades], True
+        Args:
+            weeks_back: Number of weeks to look back
+            markets_per_window: Max markets per weekly window
+
+        Returns:
+            List of unique market dictionaries (deduplicated by condition_id)
+        """
+        now = datetime.now(timezone.utc)
+        all_markets = []
+        seen_condition_ids = set()
+
+        for week in range(weeks_back):
+            end_date = now - timedelta(weeks=week)
+            start_date = end_date - timedelta(weeks=1)
+
+            start_str = start_date.strftime('%Y-%m-%d')
+            end_str = end_date.strftime('%Y-%m-%d')
+
+            print(f"\nFetching markets from {start_str} to {end_str}...")
+
+            markets = self._fetch_markets_for_window(start_str, end_str, markets_per_window)
+
+            # Deduplicate by condition_id
+            new_markets = 0
+            for market in markets:
+                cid = market.get('conditionId') or market.get('condition_id')
+                if cid and cid not in seen_condition_ids:
+                    seen_condition_ids.add(cid)
+                    all_markets.append(market)
+                    new_markets += 1
+
+            print(f"  Found {len(markets)} markets ({new_markets} new, {len(markets) - new_markets} duplicates)")
+
+        return all_markets
+
+    def _collect_trades_for_markets(self,
+                                    markets: List[Dict],
+                                    max_trades_per_market: int,
+                                    save_progress: bool = True) -> tuple[List[Dict], dict]:
+        """
+        Collect trades for a list of markets.
+
+        Args:
+            markets: List of market dictionaries
+            max_trades_per_market: Maximum trades to fetch per market
+            save_progress: Whether to save progress checkpoints
+
+        Returns:
+            Tuple of (list of trade data dicts, stats dict)
+        """
+        all_trade_data = []
+        stats = {
+            'markets_with_trades': 0,
+            'markets_skipped_no_resolution': 0,
+            'markets_skipped_no_trades': 0,
+        }
+
+        for i, market in enumerate(markets):
+            question = market.get('question', 'Unknown')[:60]
+            print(f"\nProcessing market {i+1}/{len(markets)}: {question}...")
+
+            processed_market = self.process_market_for_analysis(market)
+            if not processed_market:
+                stats['markets_skipped_no_resolution'] += 1
+                print(f"  Skipped: No valid resolution data")
+                continue
+
+            trades, truncated = self.get_trades_for_market(
+                processed_market['condition_id'], max_trades_per_market)
+            note = " (truncated)" if truncated else ""
+
+            if not trades:
+                stats['markets_skipped_no_trades'] += 1
+                print(f"  Skipped: No trades found")
+                continue
+
+            print(f"  Found {len(trades)} trades{note}")
+            stats['markets_with_trades'] += 1
+
+            all_trade_data.extend(self._process_trades(trades, processed_market))
+
+            # Save progress checkpoint
+            if save_progress and (i + 1) % 50 == 0:
+                temp_df = pd.DataFrame(all_trade_data)
+                temp_df.to_csv(self.output_dir / f'trades_progress_{i+1}.csv', index=False)
+                print(f"\n  Progress saved: {len(all_trade_data):,} trades from {stats['markets_with_trades']} markets")
+
+        return all_trade_data, stats
 
     def collect_by_time_windows(self,
                                 weeks_back: int = 8,
@@ -164,7 +275,7 @@ class PolymarketSampledCollector(PolymarketDataCollector):
 
         Args:
             weeks_back: How many weeks back to collect data
-            markets_per_window: Number of markets to collect per week
+            markets_per_window: Maximum markets to collect per week
             max_trades_per_market: Max trades per market
             save_raw: Save raw JSON data
 
@@ -177,91 +288,33 @@ class PolymarketSampledCollector(PolymarketDataCollector):
         print(f"Max trades per market: {max_trades_per_market:,}")
         print("=" * 60)
 
-        all_markets = []
-        now = datetime.now(timezone.utc)
-
-        # Collect markets from each weekly window
-        for week in range(weeks_back):
-            end_date = now - timedelta(weeks=week)
-            start_date = end_date - timedelta(weeks=1)
-
-            start_str = start_date.strftime('%Y-%m-%d')
-            end_str = end_date.strftime('%Y-%m-%d')
-
-            print(f"\nFetching markets from {start_str} to {end_str}...")
-
-            params = {
-                'closed': 'true',
-                'limit': markets_per_window,
-                'order': 'volume',
-                'ascending': 'false',
-                'end_date_min': start_str,
-                'end_date_max': end_str,
-            }
-
-            url = f"{self.gamma_url}/markets"
-            markets = self._make_request(url, params)
-
-            if markets:
-                print(f"  Found {len(markets)} markets")
-                all_markets.extend(markets)
-            else:
-                print(f"  No markets found")
-
-            time.sleep(0.5)
-
-        print(f"\nTotal markets fetched: {len(all_markets)}")
+        # Phase 1: Fetch all markets
+        all_markets = self._fetch_all_markets(weeks_back, markets_per_window)
+        print(f"\nTotal unique markets: {len(all_markets)}")
 
         if save_raw:
             with open(self.output_dir / 'raw_markets.json', 'w') as f:
                 json.dump(all_markets, f, indent=2)
 
-        # Process markets and collect trades
-        all_trade_data = []
-        markets_with_trades = 0
-        markets_skipped_no_resolution = 0
-        markets_skipped_no_trades = 0
+        # Phase 2: Collect trades for each market
+        all_trade_data, stats = self._collect_trades_for_markets(
+            all_markets, max_trades_per_market, save_progress=True)
 
-        for i, market in enumerate(all_markets):
-            question = market.get('question', 'Unknown')[:60]
-            print(f"\nProcessing market {i+1}/{len(all_markets)}: {question}...")
-
-            processed_market = self.process_market_for_analysis(market)
-            if not processed_market:
-                markets_skipped_no_resolution += 1
-                print(f"  Skipped: No valid resolution data")
-                continue
-
-            trades, was_sampled = self.get_sampled_trades_for_market(
-                processed_market['condition_id'], max_trades_per_market
-            )
-            sample_note = " (sampled)" if was_sampled else ""
-
-            if not trades:
-                markets_skipped_no_trades += 1
-                print(f"  Skipped: No trades found")
-                continue
-
-            print(f"  Found {len(trades)} trades{sample_note}")
-            markets_with_trades += 1
-
-            all_trade_data.extend(self._process_trades(trades, processed_market))
-
-            if (i + 1) % 50 == 0:
-                temp_df = pd.DataFrame(all_trade_data)
-                temp_df.to_csv(self.output_dir / f'trades_progress_{i+1}.csv', index=False)
-                print(f"\n  Progress saved: {len(all_trade_data)} trades from {markets_with_trades} markets")
-
-        # Save final dataset
+        # Phase 3: Save final dataset
         df = pd.DataFrame(all_trade_data)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_file = self.output_dir / f'polymarket_trades_{timestamp}.csv'
         df.to_csv(output_file, index=False)
 
-        self._print_summary(df, len(all_markets), markets_with_trades,
-                           markets_skipped_no_resolution, markets_skipped_no_trades, output_file)
+        self._print_summary(
+            df, len(all_markets),
+            stats['markets_with_trades'],
+            stats['markets_skipped_no_resolution'],
+            stats['markets_skipped_no_trades'],
+            output_file
+        )
 
-        # Additional: show time distribution
+        # Show time distribution
         if len(df) > 0:
             df['trade_week'] = df['trade_timestamp'].dt.to_period('W')
             print(f"\nTrades by week:")
@@ -276,9 +329,9 @@ def main():
     collector = PolymarketSampledCollector(output_dir="polymarket_data")
 
     df = collector.collect_by_time_windows(
-        weeks_back=8,
-        markets_per_window=100,
-        max_trades_per_market=10000,
+        weeks_back=20,
+        markets_per_window=1000,
+        max_trades_per_market=1000,
         save_raw=True
     )
 
